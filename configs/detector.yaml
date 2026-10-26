@@ -1,0 +1,6 @@
+names:
+  0: display_window
+path: C:/Users/ABHI/OneDrive/Desktop/DialReader/dial-reader/data/labeled/yolo_dataset
+test: images/test
+train: images/train
+val: images/val

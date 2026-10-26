@@ -1,0 +1,101 @@
+# ==============================================================================
+# DialReader Stage 2: ANN Digit Classifier Configuration
+# Fully-Connected Network (MLP) for single digit-slot classification (0-9)
+# ==============================================================================
+
+# Random seed for reproducibility across PyTorch, NumPy, and Python random
+seed: 42
+
+# ------------------------------------------------------------------------------
+# Input Image & Data Specifications
+# ------------------------------------------------------------------------------
+data:
+  # Single digit crop dimensions: [height, width] in pixels
+  # Flattened input dimension = height * width * channels = 64 * 32 * 1 = 2048
+  input_size: [64, 32]
+  channels: 1                 # 1 for Grayscale (standardizes black & red drums), 3 for RGB
+  batch_size: 32
+  num_workers: 0              # 0 recommended on Windows to avoid IPC overhead
+  train_split_ratio: 0.8      # Ratio of Knife photos for training vs validation
+
+# ------------------------------------------------------------------------------
+# ANN Model Architecture (Multi-Layer Perceptron)
+# ------------------------------------------------------------------------------
+model:
+  # Hidden layer neuron counts in sequence
+  # Input layer (2048) -> Linear(2048, 256) -> Linear(256, 128) -> Linear(128, 64) -> Output(10)
+  hidden_layers: [256, 128, 64]
+  
+  # Non-linear activation function: 'relu', 'leaky_relu', 'gelu', 'silu', 'tanh'
+  activation: "relu"
+  
+  # Batch Normalization: stabilizes internal covariate shift and speeds convergence
+  batchnorm: true
+  
+  # Dropout rate (0.0 to 0.5): regularizes network, prevents co-adaptation of neurons
+  dropout: 0.2
+  
+  # Number of output classes (digits 0 through 9)
+  num_classes: 10
+
+# ------------------------------------------------------------------------------
+# Training Hyperparameters
+# ------------------------------------------------------------------------------
+training:
+  epochs: 50
+  lr: 0.001
+  
+  # Optimizer weight decay (L2 penalty) to prevent overfitting on small datasets
+  weight_decay: 0.0001
+  
+  # Label smoothing epsilon (0.0 to 0.1): softens one-hot targets, preventing overconfidence
+  # Especially beneficial for rolling drums with slight vertical transitions
+  label_smoothing: 0.05
+  
+  # Automatically compute inverse class weights to handle underrepresented digits
+  class_weights: true
+  
+  # Learning rate scheduler: 'cosine', 'step', 'plateau', or 'none'
+  scheduler:
+    type: "cosine"
+    min_lr: 0.000005
+    step_size: 15
+    gamma: 0.5
+    
+  # Early stopping to halt training when validation loss stops improving
+  early_stopping:
+    enabled: true
+    patience: 10
+    min_delta: 0.001
+    
+  # Gradient clipping: maximum gradient norm to prevent exploding gradients
+  grad_clip: 1.0
+  
+  # Synthetic data pretraining / augmentation pool
+  use_synthetic_augmentation: true
+  synthetic_samples_per_digit: 50
+
+# ------------------------------------------------------------------------------
+# Data Augmentation (Applied strictly to training crops, never val/test)
+# ------------------------------------------------------------------------------
+augmentation:
+  brightness: 0.25            # Photometric brightness jitter (+-25%)
+  contrast: 0.25              # Contrast adjustment (+-25%)
+  rotation_deg: 8.0           # Subtle rotational jitter (+-8 degrees)
+  noise_std: 0.02             # Gaussian sensor noise
+  
+  # STRICT RULE: No horizontal or vertical flips. Digits (e.g. 2, 3, 5, 6, 9)
+  # lose meaning or turn into invalid symbols when mirrored or inverted.
+  horizontal_flip: false
+  vertical_flip: false
+
+# ------------------------------------------------------------------------------
+# Evaluation & Checkpoint Paths
+# ------------------------------------------------------------------------------
+paths:
+  labels_csv: "data/labeled/labels.csv"
+  raw_dir: "data/raw"
+  digits_dir: "data/digits"
+  checkpoint_dir: "models"
+  best_model_name: "digit_ann_best.pt"
+  results_dir: "results"

@@ -1,0 +1,11 @@
+experiment_name,description,hidden_layers,activation,batchnorm,dropout,lr,param_count,train_acc,val_acc,val_loss,best_epoch,status
+baseline,Reference baseline architecture,"[256, 128, 64]",relu,True,0.2,0.001,567242,,,,,dry_run_verified
+arch_wide,"Wider hidden capacity [512, 256, 128]","[512, 256, 128]",relu,True,0.2,0.001,1216394,,,,,dry_run_verified
+arch_deep,"Deeper network [256, 256, 128, 64]","[256, 256, 128, 64]",relu,True,0.2,0.001,633546,,,,,dry_run_verified
+arch_compact,"Lightweight 2-layer network [128, 64]","[128, 64]",relu,True,0.2,0.001,271562,,,,,dry_run_verified
+act_gelu,GELU activation function,"[256, 128, 64]",gelu,True,0.2,0.001,567242,,,,,dry_run_verified
+act_leaky_relu,LeakyReLU (slope 0.1) activation,"[256, 128, 64]",leaky_relu,True,0.2,0.001,567242,,,,,dry_run_verified
+dropout_none,No dropout (p=0.0),"[256, 128, 64]",relu,True,0.0,0.001,567242,,,,,dry_run_verified
+dropout_high,Strong regularization (p=0.4),"[256, 128, 64]",relu,True,0.4,0.001,567242,,,,,dry_run_verified
+no_batchnorm,Ablation without Batch Normalization,"[256, 128, 64]",relu,False,0.2,0.001,566346,,,,,dry_run_verified
+lr_half,Lower learning rate (0.0005),"[256, 128, 64]",relu,True,0.2,0.0005,567242,,,,,dry_run_verified

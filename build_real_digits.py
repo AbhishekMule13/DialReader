@@ -99,6 +99,10 @@ def build_dataset(clean_existing: bool = True):
             print(f"  Error extracting slots for {rel_fn}: {e}")
             continue
             
+        if res.get("status") == "no_window":
+            print(f"  Skipping {rel_fn}: no window found (status='no_window').")
+            continue
+
         if len(slots) != 4:
             print(f"  Warning: Expected 4 slots for {rel_fn}, got {len(slots)}. Skipping.")
             continue

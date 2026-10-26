@@ -188,27 +188,56 @@ def run_streamlit_app():
     model_reading = pipe_res.get("whole_digits") or "None"
     model_conf = pipe_res.get("confidence", 0.0)
     model_tenth = pipe_res.get("tenth", "")
-    
+    overlay_pil = pipe_res.get("detected_overlay")
+    status = pipe_res.get("status", "ok")
+    slot_ranges = pipe_res.get("slot_ranges", [])
+
+    if status == "no_window":
+        st.error("⚠️ **No Display Window Found**: Window detection could not locate a mechanical dial display window in this image. This image is excluded from digit datasets.")
+        col_img, col_act = st.columns([1.3, 1.0])
+        with col_img:
+            if overlay_pil is not None:
+                st.image(overlay_pil, caption="Full Photo Detection Overlay (No window found)", use_container_width=True)
+            else:
+                st.image(Image.open(raw_path), caption="Raw Photo", use_container_width=True)
+        with col_act:
+            st.warning("Cannot label digits for images without a display window.")
+            if st.button("⏭️ Next Image", key=f"next_no_win_{filename}"):
+                st.session_state.current_queue_idx += 1
+                st.rerun()
+        return
+
     # Display images in 2 columns
     col_img, col_inputs = st.columns([1.3, 1.0])
     
     with col_img:
-        st.markdown("**1. Rectified 4-Slot Display Window**")
+        # Full photo detection overlay
+        st.markdown("**1. Full Photo Detection Overlay**")
+        if overlay_pil is not None:
+            st.image(overlay_pil, width="stretch", caption="Green box indicates detected display window.")
+            
+        st.markdown("**2. Rectified 4-Slot Display Window**")
         if rectified_pil is not None:
-            # Draw slot boundary overlays for visual assistance
+            # Draw slot boundary overlays for visual assistance using actual derived slot ranges
             annotated = rectified_pil.copy()
             draw = ImageDraw.Draw(annotated)
             w_img, h_img = annotated.size
-            usable_w = w_img * (1.0 - 0.12)
-            slot_w = usable_w / 4.0
-            for s_i in range(1, 4):
-                x = int(round(s_i * slot_w))
-                draw.line([(x, 0), (x, h_img)], fill=(0, 255, 255), width=2)
-            st.image(annotated, width="stretch", caption="Cyan lines show the 4 discrete slot boundaries.")
+            if slot_ranges and len(slot_ranges) == 4:
+                for s_i in range(1, 4):
+                    # Scale slot boundary to rectified width (320px)
+                    orig_w = pipe_res.get("oriented_window").size[0]
+                    x_scaled = int(round(slot_ranges[s_i][0] * (w_img / float(orig_w))))
+                    draw.line([(x_scaled, 0), (x_scaled, h_img)], fill=(0, 255, 255), width=2)
+            else:
+                slot_w = w_img / 4.0
+                for s_i in range(1, 4):
+                    x = int(round(s_i * slot_w))
+                    draw.line([(x, 0), (x, h_img)], fill=(0, 255, 255), width=2)
+            st.image(annotated, width="stretch", caption="Cyan lines show the 4 dynamically derived slot boundaries.")
         else:
             st.warning("Display window could not be cropped automatically.")
             
-        st.markdown("**2. Extracted Discrete Slot Crops**")
+        st.markdown("**3. Extracted Discrete Slot Crops**")
         if len(slots) == 4:
             s_cols = st.columns(4)
             for i in range(4):

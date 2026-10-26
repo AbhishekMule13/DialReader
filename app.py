@@ -292,86 +292,94 @@ if input_pil is not None:
     confidence = result.get("confidence", 0.0)
     decimal_info = result.get("decimal_info", {})
     
-    # Render LCD display
-    d1 = whole_digits[0] if len(whole_digits) > 0 else "0"
-    d2 = whole_digits[1] if len(whole_digits) > 1 else "0"
-    d3 = whole_digits[2] if len(whole_digits) > 2 else "0"
-    d4 = whole_digits[3] if len(whole_digits) > 3 else "0"
-    
-    st.markdown(f"""
-    <div class="lcd-container">
-        <div class="lcd-slot">{d1}</div>
-        <div class="lcd-slot">{d2}</div>
-        <div class="lcd-slot">{d3}</div>
-        <div class="lcd-slot lcd-slot-red">{d4}</div>
-        <div class="lcd-dot">.</div>
-        <div class="lcd-slot lcd-slot-decimal">{tenth_val}</div>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    # Status badges
-    b1, b2, b3, b4 = st.columns(4)
-    with b1:
+    if status == "no_window":
+        st.error("⚠️ **No Display Window Detected**: The display window could not be found in this image. No slot crops produced.")
+        st.markdown("#### **Detection Overlay on Full Photo**")
+        overlay_img = result.get("detected_overlay", input_pil)
+        st.image(overlay_img, caption="Detection Overlay: No Display Window Found", use_container_width=True)
+        with st.expander("🔍 View Complete Pipeline JSON Output"):
+            clean_res = {k: v for k, v in result.items() if not isinstance(v, Image.Image) and not (isinstance(v, list) and v and isinstance(v[0], Image.Image))}
+            st.json(clean_res)
+    else:
+        # Render LCD display
+        d1 = whole_digits[0] if len(whole_digits) > 0 else "0"
+        d2 = whole_digits[1] if len(whole_digits) > 1 else "0"
+        d3 = whole_digits[2] if len(whole_digits) > 2 else "0"
+        d4 = whole_digits[3] if len(whole_digits) > 3 else "0"
+        
         st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-lbl">Total Reading</div>
-            <div class="metric-val" style="color:#ffaa55;">{full_val}</div>
+        <div class="lcd-container">
+            <div class="lcd-slot">{d1}</div>
+            <div class="lcd-slot">{d2}</div>
+            <div class="lcd-slot">{d3}</div>
+            <div class="lcd-slot lcd-slot-red">{d4}</div>
+            <div class="lcd-dot">.</div>
+            <div class="lcd-slot lcd-slot-decimal">{tenth_val}</div>
         </div>
         """, unsafe_allow_html=True)
-    with b2:
-        conf_color = "#00e676" if confidence >= 0.70 else "#ffa726" if confidence >= 0.50 else "#ff5252"
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-lbl">Confidence</div>
-            <div class="metric-val" style="color:{conf_color};">{int(confidence * 100)}%</div>
-        </div>
-        """, unsafe_allow_html=True)
-    with b3:
-        disp_px = decimal_info.get("displacement_px", 0.0)
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-lbl">Method 2 Shift (ΔY)</div>
-            <div class="metric-val" style="color:#58a6ff;">{disp_px:+.1f} px</div>
-        </div>
-        """, unsafe_allow_html=True)
-    with b4:
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-lbl">Inference Latency</div>
-            <div class="metric-val" style="color:#c9d1d9;">{latency} ms</div>
-        </div>
-        """, unsafe_allow_html=True)
+        
+        # Status badges
+        b1, b2, b3, b4 = st.columns(4)
+        with b1:
+            st.markdown(f"""
+            <div class="metric-card">
+                <div class="metric-lbl">Total Reading</div>
+                <div class="metric-val" style="color:#ffaa55;">{full_val}</div>
+            </div>
+            """, unsafe_allow_html=True)
+        with b2:
+            conf_color = "#00e676" if confidence >= 0.70 else "#ffa726" if confidence >= 0.50 else "#ff5252"
+            st.markdown(f"""
+            <div class="metric-card">
+                <div class="metric-lbl">Confidence</div>
+                <div class="metric-val" style="color:{conf_color};">{int(confidence * 100)}%</div>
+            </div>
+            """, unsafe_allow_html=True)
+        with b3:
+            disp_px = decimal_info.get("displacement_px", 0.0)
+            st.markdown(f"""
+            <div class="metric-card">
+                <div class="metric-lbl">Method 2 Shift (ΔY)</div>
+                <div class="metric-val" style="color:#58a6ff;">{disp_px:+.1f} px</div>
+            </div>
+            """, unsafe_allow_html=True)
+        with b4:
+            st.markdown(f"""
+            <div class="metric-card">
+                <div class="metric-lbl">Inference Latency</div>
+                <div class="metric-val" style="color:#c9d1d9;">{latency} ms</div>
+            </div>
+            """, unsafe_allow_html=True)
 
-    # Mid-roll transition notice
-    if result.get("is_mid_roll"):
-        st.warning("⚠️ **Mid-Roll Drum Transition Detected:** The 4th red drum is rolling between numbers. Method 2 continuously measured the active digit displacement.")
+        # Mid-roll transition notice
+        if result.get("is_mid_roll"):
+            st.warning("⚠️ **Mid-Roll Drum Transition Detected:** The 4th red drum is rolling between numbers. Method 2 continuously measured the active digit displacement.")
 
-    st.markdown("---")
+        st.markdown("---")
 
-    # ---------------------------------------------------------
-    # Visual Breakdown Columns
-    # ---------------------------------------------------------
-    col_left, col_right = st.columns([1.1, 1.0])
+        # Visual Breakdown Columns
+        col_left, col_right = st.columns([1.1, 1.0])
 
-    with col_left:
-        st.markdown("#### **1. Full Input Photo & Detected Window**")
-        st.image(input_pil, caption="Input Photo", use_container_width=True)
+        with col_left:
+            st.markdown("#### **1. Full Input Photo & Detected Window Overlay**")
+            overlay_img = result.get("detected_overlay", input_pil)
+            st.image(overlay_img, caption="Green box indicates detected display window", use_container_width=True)
 
-    with col_right:
-        st.markdown("#### **2. Method 2 Inspection: Rectified Window**")
-        rectified_window = result.get("rectified_window")
-        if rectified_window is not None:
-            annotated = create_annotated_window(
-                rectified_window,
-                decimal_info,
-                whole_digits,
-                full_val
-            )
-            st.image(
-                annotated,
-                caption="Rectified Window: Yellow=Baseline, Blue=Digit Square, Red=Digit Centroid, Green=Slot Dividers",
-                use_container_width=True
-            )
+        with col_right:
+            st.markdown("#### **2. Method 2 Inspection: Rectified Window**")
+            rectified_window = result.get("rectified_window")
+            if rectified_window is not None:
+                annotated = create_annotated_window(
+                    rectified_window,
+                    decimal_info,
+                    whole_digits,
+                    full_val
+                )
+                st.image(
+                    annotated,
+                    caption="Rectified Window: Yellow=Baseline, Blue=Digit Square, Red=Digit Centroid, Green=Slot Dividers",
+                    use_container_width=True
+                )
         
         # Method 2 metrics explanation card
         raw_tenth = decimal_info.get("raw_tenth", 0.0)

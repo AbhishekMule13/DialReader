@@ -1,25 +1,13 @@
 """
 Stage 3: End-to-End Inference Pipeline for DialReader
 
-Two-stage modular pipeline:
-  1. Stage 1 (YOLO Detector): Locates and extracts the display_window crop.
-  2. Normalizer: Canonical rectification and perspective correction.
-  3. Stage 2 (Digit ANN): Runs the single-digit MLP 4 times (once per slot)
-     to classify digits 0-9 and detect mid-roll transitions on drum 4.
-
-Command:
-    python src/infer.py --image path/to/photo.jpg [--min_conf 0.65]
-
-Output JSON format:
-{
-  "value": "0021",
-  "confidence": 0.96,
-  "status": "ok" | "unreadable",
-  "per_digit_confidence": [0.99, 0.98, 0.95, 0.92],
-  "is_mid_roll": false,
-  "detector_confidence": 0.95,
-  "dial_variant": "standard_3black_1red"
-}
+Three-stage modular pipeline:
+  1. Stage 1 (Full-Resolution Window Detector): Locates and extracts the display_window crop.
+     Strict: if no window is detected, returns status="no_window" and produces NO slot crops.
+  2. Stage 2 (WindowNormalizer): Deskews, auto-orients, and dynamically derives 4 discrete slot
+     crops based on the red drum position.
+  3. Stage 3 (Method 2 Decimal & Digit ANN): Measures Tenth decimal fraction and classifies
+     digits 0-9 for the 4 slots.
 """
 
 import argparse
@@ -44,9 +32,10 @@ from src.train_digits import load_config
 
 class DialReadingPipeline:
     """
-    Two-stage pipeline:
-    1. YOLO Detector -> crops display_window
-    2. WindowNormalizer & DigitANNPredictor -> rectifies, extracts 4 slots, classifies digits
+    End-to-end pipeline:
+    1. Full-Resolution Display Window Detector -> crops display window, produces overlay
+    2. WindowNormalizer -> dynamically extracts 4 slots and Method 2 decimal measurement
+    3. Digit Classifier -> classifies digits 0-9
     """
 
     def __init__(
@@ -63,12 +52,10 @@ class DialReadingPipeline:
         self.device = device
         self.cfg = load_config(config_path)
 
-        # 1. Detector
-        self.detector = None
-        if detector_weights and Path(detector_weights).exists():
-            self.detector = DialDetector(detector_weights, device=device)
+        # 1. Detector (uses trained YOLO if provided/exists, else full-resolution aperture detector)
+        self.detector = DialDetector(detector_weights, device=device)
 
-        # 2. ANN Digit Classifier (evaluated 4 times per dial)
+        # 2. ANN Digit Classifier
         self.classifier = None
         weights_candidates = [
             Path(classifier_weights) if classifier_weights else None,
@@ -86,7 +73,7 @@ class DialReadingPipeline:
                 )
                 break
 
-        # 3. Normalizer & Slot Splitter
+        # 3. Normalizer & Dynamic Slot Splitter
         self.normalizer = WindowNormalizer()
 
     def read_image(
@@ -96,17 +83,9 @@ class DialReadingPipeline:
     ) -> Dict[str, Any]:
         """
         Executes end-to-end reading on a dial image.
+        If no display window is found, strictly returns status="no_window" and NO slot crops.
         """
-
-        if self.classifier is None:
-            return {
-                "value": None,
-                "confidence": 0.0,
-                "status": "unreadable",
-                "reason": "Digit ANN classifier weights not loaded. Please train or provide model weights."
-            }
-
-        # Load and orient image
+        # Load and decode image
         try:
             if isinstance(image_input, (str, Path)):
                 img_p = Path(image_input)
@@ -115,7 +94,10 @@ class DialReadingPipeline:
                         "value": None,
                         "confidence": 0.0,
                         "status": "unreadable",
-                        "reason": f"File does not exist: {img_p}"
+                        "reason": f"File does not exist: {img_p}",
+                        "window_crop": None,
+                        "digit_slots": [],
+                        "detected_overlay": None
                     }
                 pil_img = Image.open(img_p)
             elif isinstance(image_input, Image.Image):
@@ -125,7 +107,10 @@ class DialReadingPipeline:
                     "value": None,
                     "confidence": 0.0,
                     "status": "unreadable",
-                    "reason": f"Unsupported image input type: {type(image_input)}"
+                    "reason": f"Unsupported image input type: {type(image_input)}",
+                    "window_crop": None,
+                    "digit_slots": [],
+                    "detected_overlay": None
                 }
             pil_img = ImageOps.exif_transpose(pil_img).convert("RGB")
         except Exception as e:
@@ -133,109 +118,81 @@ class DialReadingPipeline:
                 "value": None,
                 "confidence": 0.0,
                 "status": "unreadable",
-                "reason": f"Could not decode image: {e}"
+                "reason": f"Could not decode image: {e}",
+                "window_crop": None,
+                "digit_slots": [],
+                "detected_overlay": None
             }
 
-        # Stage 1: Window Detection
-        window_crop = None
-        det_conf = 1.0
+        # Stage 1: Window Detection (Full Resolution Original, NO fallback)
+        detections = self.detector.detect(pil_img, conf_threshold=self.min_detector_conf)
 
-        if self.detector is not None and self.detector.is_loaded():
-            detections = self.detector.detect(pil_img, conf_threshold=self.min_detector_conf)
-            if detections:
-                top_det = detections[0]
-                window_crop = top_det["crop"]
-                det_conf = top_det["confidence"]
+        if not detections:
+            # Rule 1: No fallback! Return status="no_window" and do NOT produce slot crops.
+            overlay = self.detector.draw_overlay(pil_img, None)
+            return {
+                "value": None,
+                "confidence": 0.0,
+                "status": "no_window",
+                "reason": "No display window detected in photo.",
+                "window_crop": None,
+                "rectified_window": None,
+                "oriented_window": None,
+                "digit_slots": [],
+                "detected_overlay": overlay,
+                "detection_box": None
+            }
 
-        # Bezel aperture detector fallback if no YOLO detection
-        if window_crop is None:
-            # Check if image itself is already a cropped window (aspect ratio > 1.6)
-            img_w, img_h = pil_img.size
-            aspect = max(img_w, img_h) / max(1, min(img_w, img_h))
-            if aspect > 1.6 and min(img_w, img_h) < 400:
-                window_crop = pil_img
-                det_conf = 0.90
-            else:
-                # Color bezel contour search
-                np_img = np.array(pil_img)
-                hsv = cv2.cvtColor(np_img, cv2.COLOR_RGB2HSV)
-                orange = (hsv[:,:,0] >= 5) & (hsv[:,:,0] <= 25) & (hsv[:,:,1] > 90) & (hsv[:,:,2] > 70)
-                kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
-                orange_closed = cv2.morphologyEx(orange.astype(np.uint8) * 255, cv2.MORPH_CLOSE, kernel)
-                cnts, hier = cv2.findContours(orange_closed, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
-                candidates = []
-                if hier is not None:
-                    for i, c in enumerate(cnts):
-                        x, y, w, h = cv2.boundingRect(c)
-                        c_aspect = w / float(max(1, h))
-                        area = cv2.contourArea(c)
-                        if hier[0][i][3] != -1 and 1.6 < c_aspect < 4.5 and area > 5000:
-                            candidates.append((area, (x, y, w, h)))
-                if candidates:
-                    best_box = max(candidates, key=lambda c: c[0])[1]
-                    bx, by, bw, bh = best_box
-                    window_crop = pil_img.crop((bx, by, bx+bw, by+bh))
-                    det_conf = 0.88
-                elif aspect > 1.3:
-                    window_crop = pil_img
-                    det_conf = 0.80
-                else:
-                    return {
-                        "value": None,
-                        "confidence": 0.0,
-                        "status": "unreadable",
-                        "reason": "No display window detected in photo."
-                    }
+        top_det = detections[0]
+        window_crop = top_det["crop"]
+        det_conf = top_det["confidence"]
+        overlay = self.detector.draw_overlay(pil_img, top_det)
 
-        # Stage 2: Normalization & Slot Extraction (including Method 2 decimal measurement)
+        # Stage 2: Normalization & Dynamic Slot Extraction (Stage 2) + Method 2 Decimal (Stage 3)
         proc = self.normalizer.process(window_crop, orientation=manual_orientation)
         slots = proc["digit_slots"]
         layout_info = proc["layout"]
         decimal_info = proc.get("decimal_info", {})
         rectified_window = proc["rectified_window"]
+        oriented_window = proc["oriented_window"]
+        slot_ranges = proc["slot_ranges"]
+        digit_positions = proc["digit_vertical_positions"]
 
         if len(slots) != 4:
             return {
                 "value": None,
                 "confidence": 0.0,
                 "status": "unreadable",
-                "reason": f"Unexpected slot extraction count: {len(slots)} (expected 4)"
+                "reason": f"Unexpected slot extraction count: {len(slots)} (expected 4)",
+                "window_crop": window_crop,
+                "digit_slots": [],
+                "detected_overlay": overlay
             }
 
         # Stage 3: Classify each of the 4 slots with the Digit ANN
-        ann_result = self.classifier.predict_dial(slots)
-        value_str = ann_result["reading"]
-        per_digit_conf = ann_result["per_digit_confidence"]
-        is_mid_roll = ann_result["is_mid_roll"]
+        if self.classifier is not None:
+            ann_result = self.classifier.predict_dial(slots)
+            value_str = ann_result["reading"]
+            per_digit_conf = ann_result["per_digit_confidence"]
+            is_mid_roll = ann_result["is_mid_roll"]
+            min_d_conf = min(per_digit_conf)
+            avg_d_conf = sum(per_digit_conf) / 4.0
+            overall_conf = round(avg_d_conf * det_conf, 4)
+        else:
+            value_str = "0000"
+            per_digit_conf = [0.0, 0.0, 0.0, 0.0]
+            is_mid_roll = False
+            min_d_conf = 0.0
+            overall_conf = 0.0
 
-        min_d_conf = min(per_digit_conf)
-        avg_d_conf = sum(per_digit_conf) / 4.0
-        overall_conf = round(avg_d_conf * det_conf, 4)
-
-        # Stage 4: Combine whole digits with Method 2 decimal fraction
+        # Combine whole digits with Method 2 decimal fraction
         decimal_tenth = decimal_info.get("tenth", 0)
         decimal_fraction = decimal_info.get("decimal_fraction", 0.0)
         full_value_str = f"{value_str}.{decimal_tenth}"
 
-        # Check readability threshold
-        if min_d_conf < self.min_digit_conf:
-            return {
-                "value": full_value_str,
-                "whole_digits": value_str,
-                "fraction": decimal_fraction,
-                "tenth": decimal_tenth,
-                "decimal_info": decimal_info,
-                "confidence": overall_conf,
-                "status": "unreadable",
-                "per_digit_confidence": per_digit_conf,
-                "is_mid_roll": is_mid_roll,
-                "detector_confidence": round(det_conf, 4),
-                "dial_variant": layout_info["variant"],
-                "window_crop": window_crop,
-                "rectified_window": rectified_window,
-                "digit_slots": slots,
-                "reason": f"Digit confidence ({min_d_conf:.3f}) fell below threshold ({self.min_digit_conf})"
-            }
+        status = "ok"
+        if self.classifier is not None and min_d_conf < self.min_digit_conf:
+            status = "unreadable"
 
         return {
             "value": full_value_str,
@@ -244,22 +201,27 @@ class DialReadingPipeline:
             "tenth": decimal_tenth,
             "decimal_info": decimal_info,
             "confidence": overall_conf,
-            "status": "ok",
+            "status": status,
             "per_digit_confidence": per_digit_conf,
             "is_mid_roll": is_mid_roll,
             "detector_confidence": round(det_conf, 4),
             "dial_variant": layout_info["variant"],
             "window_crop": window_crop,
+            "oriented_window": oriented_window,
             "rectified_window": rectified_window,
-            "digit_slots": slots
+            "digit_slots": slots,
+            "slot_ranges": slot_ranges,
+            "digit_vertical_positions": digit_positions,
+            "detected_overlay": overlay,
+            "detection_box": top_det.get("pixel_bbox")
         }
 
 
 def main():
     parser = argparse.ArgumentParser(description="End-to-End Dial Reading CLI with ANN Classifier")
     parser.add_argument("--image", type=str, required=True, help="Path to dial image (.jpg, .png, etc.)")
-    parser.add_argument("--detector_weights", type=str, default="models/detector_best.pt")
-    parser.add_argument("--classifier_weights", type=str, default="models/digit_ann_best.pt")
+    parser.add_argument("--detector_weights", type=str, default=None)
+    parser.add_argument("--classifier_weights", type=str, default="models/best_digit_ann.pt")
     parser.add_argument("--config", type=str, default="configs/digit_ann.yaml")
     parser.add_argument("--min_conf", type=float, default=0.65, help="Minimum per-digit confidence")
     parser.add_argument("--orientation", type=int, default=None, help="Manual rotation angle (0/90/180/270)")
@@ -268,20 +230,28 @@ def main():
     args = parser.parse_args()
 
     pipeline = DialReadingPipeline(
-        detector_weights=Path(args.detector_weights),
-        classifier_weights=Path(args.classifier_weights),
+        detector_weights=Path(args.detector_weights) if args.detector_weights else None,
+        classifier_weights=Path(args.classifier_weights) if args.classifier_weights else None,
         config_path=args.config,
         device=args.device,
         min_digit_conf=args.min_conf
     )
 
     result = pipeline.read_image(Path(args.image), manual_orientation=args.orientation)
-    # Filter out non-serializable PIL Image objects for CLI JSON output
+    def default_serializer(o):
+        if isinstance(o, (np.integer, np.int64, np.int32)):
+            return int(o)
+        if isinstance(o, (np.floating, np.float64, np.float32)):
+            return float(o)
+        if isinstance(o, np.ndarray):
+            return o.tolist()
+        return str(o)
+
     clean_result = {
         k: v for k, v in result.items()
         if not isinstance(v, Image.Image) and not (isinstance(v, list) and v and isinstance(v[0], Image.Image))
     }
-    print(json.dumps(clean_result, indent=2))
+    print(json.dumps(clean_result, indent=2, default=default_serializer))
 
 
 if __name__ == "__main__":

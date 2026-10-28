@@ -93,8 +93,9 @@ class WindowNormalizer:
         - Locates the red drum (HSV red) on the right end of the window.
         - The three black drums are to its left.
         - Derives individual drum width W_drum = (red_x_start - black_x_start) / 3.0.
-        - Splits window into 4 discrete slot crops.
-        - Computes the vertical position (cy) and bounding box of each digit numeral.
+        - Splits window into 4 discrete equal-width slot crops for digit recognition.
+        - Separately extracts the unclipped red drum and tick measurement region [red_x_start, W_window].
+        - Computes the vertical position (cy) and bounding box of each digit numeral without tick interference.
         """
         arr = np.array(window_img.convert("RGB"))
         h, w, _ = arr.shape
@@ -111,7 +112,7 @@ class WindowNormalizer:
         red_indices = np.where(red_cols[mid_x:] >= red_thresh)[0]
 
         if len(red_indices) > 0:
-            red_x_start = mid_x + red_indices[0]
+            red_x_start = int(mid_x + red_indices[0])
         else:
             # Fallback if all-black variant: use 72% width
             red_x_start = int(round(w * 0.72))
@@ -123,27 +124,38 @@ class WindowNormalizer:
         black_thresh = max(3, int(h * 0.20))
         black_indices = np.where(drum_cols[:red_x_start] >= black_thresh)[0]
 
-        black_x_start = black_indices[0] if len(black_indices) > 0 else 0
+        black_x_start = int(black_indices[0]) if len(black_indices) > 0 else 0
 
         # Physical geometry: 3 black drums of equal width to the left of the red drum
         black_w = max(3, red_x_start - black_x_start)
-        drum_w = black_w / 3.0
+        drum_w = float(black_w / 3.0)
 
         slot_ranges = []
         slot_crops = []
 
-        # Slots 1, 2, 3 (Black drums)
+        # Slots 1, 2, 3 (Black drums) - strictly 1 drum_w wide each
         for i in range(3):
             x1 = int(round(black_x_start + i * drum_w))
             x2 = int(round(black_x_start + (i + 1) * drum_w))
             slot_ranges.append((x1, x2))
             slot_crops.append(window_img.crop((x1, 0, x2, h)))
 
-        # Slot 4 (Red drum)
-        x1 = red_x_start
-        x2 = min(w, int(round(red_x_start + drum_w)))
-        slot_ranges.append((x1, x2))
-        slot_crops.append(window_img.crop((x1, 0, x2, h)))
+        # Slot 4 (Red drum digit recognition slot) - strictly 1 drum_w wide, matching black drums
+        x1_red = int(red_x_start)
+        x2_red = int(min(w, round(red_x_start + drum_w)))
+        slot_ranges.append((x1_red, x2_red))
+        slot_crops.append(window_img.crop((x1_red, 0, x2_red, h)))
+
+        # Unclipped Red Drum Region: from red_x_start to the complete right edge of the window
+        # Contains numeral + graduation scale + right vernier margin
+        red_drum_crop = window_img.crop((x1_red, 0, w, h))
+        red_drum_range = (x1_red, int(w))
+
+        # Tick measurement sub-region: right portion of red drum extending to window edge
+        tick_x_start = int(min(w - 1, round(red_x_start + drum_w * 0.55)))
+        tick_crop = window_img.crop((tick_x_start, 0, w, h))
+        tick_range = (tick_x_start, int(w))
+        vernier_margin_px = int(max(0, w - x2_red))
 
         # 3. Detect vertical centroid position of each digit
         digit_vertical_positions = []
@@ -153,40 +165,68 @@ class WindowNormalizer:
         for i, sc in enumerate(slot_crops):
             sc_np = np.array(sc.convert("RGB"))
             gray = cv2.cvtColor(sc_np, cv2.COLOR_BGR2GRAY)
+            sc_w = slot_ranges[i][1] - slot_ranges[i][0]
             # Threshold white numeral on dark/red background
             white = gray > 140
             num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(white.astype(np.uint8) * 255)
 
             candidates = []
             for j in range(1, num_labels):
-                ba = stats[j, cv2.CC_STAT_AREA]
-                bw = stats[j, cv2.CC_STAT_WIDTH]
-                bh = stats[j, cv2.CC_STAT_HEIGHT]
-                cx, cy = centroids[j]
+                ba = int(stats[j, cv2.CC_STAT_AREA])
+                bw = int(stats[j, cv2.CC_STAT_WIDTH])
+                bh = int(stats[j, cv2.CC_STAT_HEIGHT])
+                cx, cy = float(centroids[j][0]), float(centroids[j][1])
+
+                # Filter out slot divider vertical lines at boundary
+                if bw < 10 and (stats[j, cv2.CC_STAT_LEFT] <= 2 or stats[j, cv2.CC_STAT_LEFT] + bw >= sc_w - 2):
+                    continue
+
+                # In Slot 4 (red drum), ensure ticks are not mistakenly picked as the digit numeral
+                if i == 3:
+                    if bh <= 14 and ba < 80:
+                        continue
+                    if cx > sc_w * 0.65 and ba < 120:
+                        continue
+
                 if ba > 20 and bh > 10 and bw > 4:
-                    candidates.append((ba, cy, (slot_ranges[i][0] + stats[j, cv2.CC_STAT_LEFT], stats[j, cv2.CC_STAT_TOP], bw, bh), bh))
+                    box = (
+                        int(slot_ranges[i][0] + stats[j, cv2.CC_STAT_LEFT]),
+                        int(stats[j, cv2.CC_STAT_TOP]),
+                        int(bw),
+                        int(bh)
+                    )
+                    candidates.append((ba, cy, box, bh))
 
             if candidates:
                 # Largest white numeral component
                 best = max(candidates, key=lambda c: c[0])
                 digit_vertical_positions.append(float(best[1]))
                 digit_boxes.append(best[2])
-                digit_heights.append(best[3])
+                digit_heights.append(int(best[3]))
             else:
                 digit_vertical_positions.append(float(h / 2.0))
-                digit_boxes.append((slot_ranges[i][0], int(h * 0.25), int(drum_w), int(h * 0.5)))
+                default_box = (int(slot_ranges[i][0]), int(h * 0.25), int(drum_w), int(h * 0.5))
+                digit_boxes.append(default_box)
                 digit_heights.append(int(h * 0.5))
 
         return {
             "slot_crops": slot_crops,
             "slot_ranges": slot_ranges,
-            "drum_width": round(drum_w, 2),
-            "red_x_start": red_x_start,
-            "black_x_start": black_x_start,
-            "digit_vertical_positions": [round(p, 2) for p in digit_vertical_positions],
+            "drum_width": round(float(drum_w), 2),
+            "red_x_start": int(red_x_start),
+            "black_x_start": int(black_x_start),
+            "digit_vertical_positions": [round(float(p), 2) for p in digit_vertical_positions],
             "digit_boxes": digit_boxes,
-            "digit_heights": digit_heights
+            "digit_heights": digit_heights,
+            "red_drum_crop": red_drum_crop,
+            "red_drum_range": red_drum_range,
+            "tick_crop": tick_crop,
+            "tick_range": tick_range,
+            "vernier_margin_px": vernier_margin_px
         }
+
+    # Public alias for backward compatibility and test conventions
+    _split_slots = split_into_slots
 
     def measure_red_drum_fraction(
         self,
@@ -196,15 +236,26 @@ class WindowNormalizer:
         """
         Stage 3: Method 2 Decimal Measurement
         - Measures signed displacement of white digit on red drum from calibrated reading baseline.
+        - Uses the MEDIAN of valid black-digit centers (Slots 1-3) to resist transitioning digits.
         - Digit pitch is measured dynamically in that image (pitch = 1.5 * avg_digit_height).
+        - Analyzes unclipped tick region [red_x_start, W_window] for graduation verification.
         - tenth = round(displacement / (pitch / 10)).
         """
         cy_list = slot_data["digit_vertical_positions"]
         digit_boxes = slot_data["digit_boxes"]
         digit_heights = slot_data["digit_heights"]
 
-        # Reading baseline: mean of Slots 1-3
-        baseline_y = float(np.mean(cy_list[:3])) if len(cy_list) >= 3 else float(window_height / 2.0)
+        # Reading baseline: MEDIAN of valid black digits (Slots 1-3)
+        # Using median ensures that a transitioning/mid-roll black digit does not skew the baseline.
+        valid_black_cy = [
+            float(cy) for cy in cy_list[:3]
+            if cy is not None and not np.isnan(cy) and 0 < cy < window_height
+        ]
+        if valid_black_cy:
+            baseline_y = float(np.median(valid_black_cy))
+        else:
+            baseline_y = float(window_height / 2.0)
+
         red_cy = float(cy_list[3]) if len(cy_list) >= 4 else float(window_height / 2.0)
 
         # Signed displacement: dial rolling upward as value increases -> baseline_y - red_cy
@@ -222,6 +273,50 @@ class WindowNormalizer:
 
         red_digit_box = digit_boxes[3] if len(digit_boxes) >= 4 else None
 
+        # Analyze unclipped tick measurement region if provided
+        tick_crop = slot_data.get("tick_crop")
+        tick_info: Dict[str, Any] = {
+            "ticks_detected": 0,
+            "longest_tick_cy": None,
+            "longest_tick_width": 0,
+            "tick_pitch_px": None,
+            "tick_offset_from_digit": None,
+            "vernier_margin_px": int(slot_data.get("vernier_margin_px", 0))
+        }
+
+        if tick_crop is not None:
+            try:
+                tc_arr = np.array(tick_crop.convert("RGB"))
+                min_rgb = np.minimum(np.minimum(tc_arr[:, :, 0], tc_arr[:, :, 1]), tc_arr[:, :, 2])
+                white_ticks = (min_rgb > 120).astype(np.uint8) * 255
+                num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(white_ticks)
+
+                ticks = []
+                for j in range(1, num_labels):
+                    ba = int(stats[j, cv2.CC_STAT_AREA])
+                    bw = int(stats[j, cv2.CC_STAT_WIDTH])
+                    bh = int(stats[j, cv2.CC_STAT_HEIGHT])
+                    cy = float(centroids[j][1])
+                    if bw >= 4 and bh <= 14 and ba >= 6:
+                        ticks.append((bw, bh, cy, ba))
+
+                if ticks:
+                    ticks.sort(key=lambda t: t[0], reverse=True)  # longest tick first
+                    longest = ticks[0]
+                    tick_info["ticks_detected"] = len(ticks)
+                    tick_info["longest_tick_width"] = int(longest[0])
+                    tick_info["longest_tick_cy"] = round(float(longest[2]), 2)
+                    tick_info["tick_offset_from_digit"] = round(float(longest[2] - red_cy), 2)
+
+                    if len(ticks) >= 3:
+                        y_coords = sorted([t[2] for t in ticks])
+                        diffs = np.diff(y_coords)
+                        valid_diffs = [d for d in diffs if 4 <= d <= 25]
+                        if valid_diffs:
+                            tick_info["tick_pitch_px"] = round(float(np.median(valid_diffs)), 2)
+            except Exception:
+                pass
+
         return {
             "decimal_fraction": fraction,
             "tenth": tenth,
@@ -233,7 +328,11 @@ class WindowNormalizer:
             "pitch_px": round(float(pitch), 2),
             "pitch_per_tenth": round(float(pitch_per_tenth), 2),
             "digit_box": red_digit_box,
-            "status": "ok"
+            "digit_bbox": red_digit_box,
+            "status": "ok",
+            "tick_info": tick_info,
+            "ticks_detected": tick_info["ticks_detected"],
+            "vernier_margin_px": tick_info["vernier_margin_px"]
         }
 
     def process(
@@ -264,5 +363,10 @@ class WindowNormalizer:
             "digit_vertical_positions": slot_data["digit_vertical_positions"],
             "digit_boxes": slot_data["digit_boxes"],
             "drum_width": slot_data["drum_width"],
-            "decimal_info": decimal_info
+            "decimal_info": decimal_info,
+            "red_drum_crop": slot_data.get("red_drum_crop"),
+            "red_drum_range": slot_data.get("red_drum_range"),
+            "tick_crop": slot_data.get("tick_crop"),
+            "tick_range": slot_data.get("tick_range"),
+            "vernier_margin_px": slot_data.get("vernier_margin_px", 0)
         }

@@ -21,12 +21,16 @@ class DialDetector:
         self,
         model_path: Optional[Union[str, Path]] = None,
         device: str = "cpu",
-        margin_pct: float = 0.04
+        margin_pct: float = 0.04,
+        max_coarse_dim: int = 1280,
+        enable_coarse_to_fine: bool = True
     ):
         self.device = device
         self.model_path = Path(model_path) if model_path else None
         self.model = None
         self.margin_pct = margin_pct
+        self.max_coarse_dim = max_coarse_dim
+        self.enable_coarse_to_fine = enable_coarse_to_fine
 
         if self.model_path and self.model_path.exists():
             self._load_model()
@@ -230,12 +234,33 @@ class DialDetector:
             except Exception as e:
                 print(f"YOLO predict error ({e}), falling back to fullres detector.")
 
-        # Full-resolution aperture detector
-        aperture_det = self.detect_aperture_fullres(pil_img)
-        if aperture_det is not None:
-            return [aperture_det]
+        # Classical full-resolution window detector
+        from src.window_detect import WindowDetector
+        win_detector = WindowDetector(
+            margin_black=self.margin_pct,
+            margin_tick=self.margin_pct * 1.3,
+            max_coarse_dim=self.max_coarse_dim,
+            enable_coarse_to_fine=self.enable_coarse_to_fine
+        )
+        res = win_detector.detect(pil_img)
+        if res.get("status") in ["ok", "too_far"]:
+            return [{
+                "bbox": res["bbox"],
+                "pixel_bbox": res["pixel_bbox"],
+                "confidence": res["confidence"],
+                "crop": res["warped_window"],
+                "polygon": res.get("polygon"),
+                "overlay": res.get("detected_overlay"),
+                "white_digit_count": res.get("white_digit_count", 0),
+                "aspect_ratio": res.get("aspect_ratio", 0.0),
+                "status": res.get("status"),
+                "reason": res.get("reason"),
+                "is_already_crop": False,
+                "was_coarse_to_fine": res.get("was_coarse_to_fine", False),
+                "used_fallback": res.get("used_fallback", False)
+            }]
 
-        # No window found! Return empty list
+        # No window found! Return empty list (NO fallback)
         return []
 
     def draw_overlay(
@@ -246,6 +271,9 @@ class DialDetector:
         """
         Draws bounding box overlay on full-resolution original image for visual verification.
         """
+        if detection is not None and detection.get("overlay") is not None:
+            return detection["overlay"]
+
         pil_img = self._to_pil_rgb(image_input).copy()
         draw = ImageDraw.Draw(pil_img)
         w, h = pil_img.size

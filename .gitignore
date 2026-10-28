@@ -2,6 +2,13 @@ __pycache__/
 *.py[cod]
 *$py.class
 .ipynb_checkpoints/
+.pytest_cache/
 *.pt
 !models/best_digit_ann.pt
 .vscode/
+
+# Ignore large debug outputs (over 1 GB of temporary crops) and scratch scripts
+results/*
+!results/experiments.csv
+!results/diagnose_contact_sheet_20.png
+scratch/

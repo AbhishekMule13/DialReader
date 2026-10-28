@@ -26,8 +26,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.detect import DialDetector
 from src.crop import WindowNormalizer
-from src.models import DigitANNPredictor
-from src.train_digits import load_config
+from src.digits import PixelDigitRecognizer
 
 
 class DialReadingPipeline:
@@ -35,43 +34,35 @@ class DialReadingPipeline:
     End-to-end pipeline:
     1. Full-Resolution Display Window Detector -> crops display window, produces overlay
     2. WindowNormalizer -> dynamically extracts 4 slots and Method 2 decimal measurement
-    3. Digit Classifier -> classifies digits 0-9
+    3. Classical PixelDigitRecognizer -> recognizes digits 0-9 with template matching & geometric analysis
     """
 
     def __init__(
         self,
         detector_weights: Optional[Path] = None,
         classifier_weights: Optional[Path] = None,
-        config_path: str = "configs/digit_ann.yaml",
+        config_path: Optional[str] = None,
         device: str = "cpu",
-        min_digit_conf: float = 0.65,
-        min_detector_conf: float = 0.40
+        min_digit_conf: float = 0.35,
+        min_detector_conf: float = 0.40,
+        recognizer: Optional[PixelDigitRecognizer] = None
     ):
         self.min_digit_conf = min_digit_conf
         self.min_detector_conf = min_detector_conf
         self.device = device
-        self.cfg = load_config(config_path)
 
-        # 1. Detector (uses trained YOLO if provided/exists, else full-resolution aperture detector)
+        # 1. Detector (pure CV full-resolution aperture detector)
         self.detector = DialDetector(detector_weights, device=device)
 
-        # 2. ANN Digit Classifier
-        self.classifier = None
-        weights_candidates = [
-            Path(classifier_weights) if classifier_weights else None,
-            PROJECT_ROOT / "models" / "best_digit_ann.pt",
-            PROJECT_ROOT / "models" / "digit_ann_best.pt",
-            Path("models/best_digit_ann.pt"),
-            Path("models/digit_ann_best.pt")
-        ]
-        for w in weights_candidates:
-            if w and w.exists():
-                self.classifier = DigitANNPredictor(
-                    model_path=w,
-                    config=self.cfg,
-                    device=device
-                )
-                break
+        # 2. Classical CV Digit Recognizer (zero neural network inference)
+        if recognizer is not None:
+            self.classifier = recognizer
+        else:
+            self.classifier = PixelDigitRecognizer(
+                min_confidence=min_digit_conf,
+                auto_load_verified=True,
+                project_root=PROJECT_ROOT
+            )
 
         # 3. Normalizer & Dynamic Slot Splitter
         self.normalizer = WindowNormalizer()
@@ -169,15 +160,17 @@ class DialReadingPipeline:
                 "detected_overlay": overlay
             }
 
-        # Stage 3: Classify each of the 4 slots with the Digit ANN
+        # Stage 3: Classify each of the 4 slots with the classical PixelDigitRecognizer
+        slot_diagnostics = []
         if self.classifier is not None:
-            ann_result = self.classifier.predict_dial(slots)
-            value_str = ann_result["reading"]
-            per_digit_conf = ann_result["per_digit_confidence"]
-            is_mid_roll = ann_result["is_mid_roll"]
-            min_d_conf = min(per_digit_conf)
-            avg_d_conf = sum(per_digit_conf) / 4.0
-            overall_conf = round(avg_d_conf * det_conf, 4)
+            recog_result = self.classifier.predict_dial(slots)
+            value_str = recog_result["reading"]
+            per_digit_conf = recog_result["per_digit_confidence"]
+            is_mid_roll = recog_result["is_mid_roll"]
+            min_d_conf = min(per_digit_conf) if per_digit_conf else 0.0
+            avg_d_conf = sum(per_digit_conf) / len(per_digit_conf) if per_digit_conf else 0.0
+            overall_conf = float(round(avg_d_conf * det_conf, 4))
+            slot_diagnostics = recog_result.get("diagnostics", [])
         else:
             value_str = "0000"
             per_digit_conf = [0.0, 0.0, 0.0, 0.0]
@@ -191,8 +184,29 @@ class DialReadingPipeline:
         full_value_str = f"{value_str}.{decimal_tenth}"
 
         status = "ok"
+        reason = None
+        reasons_list = []
+
+        for s in slot_diagnostics:
+            s_stat = s.get("status", "ok")
+            if s_stat != "ok":
+                s_idx = s.get("slot_index", 0) + 1
+                s_r = s.get("reason", f"Status: {s_stat}")
+                reasons_list.append(f"Slot {s_idx} ({s_stat}): {s_r}")
+
+        if any(s.get("status") in ("uncertain", "missing_template", "no_digit") for s in slot_diagnostics):
+            status = "uncertain"
         if self.classifier is not None and min_d_conf < self.min_digit_conf:
-            status = "unreadable"
+            status = "unreadable" if min_d_conf < 0.20 else "uncertain"
+
+        if status == "ok":
+            reason = "Reading recognized with high confidence"
+        elif reasons_list:
+            reason = " | ".join(reasons_list)
+        elif self.classifier is not None and min_d_conf < self.min_digit_conf:
+            reason = f"Low confidence: minimum slot confidence ({min_d_conf:.2f}) < threshold ({self.min_digit_conf:.2f})"
+        else:
+            reason = f"Reading status: {status}"
 
         return {
             "value": full_value_str,
@@ -202,9 +216,12 @@ class DialReadingPipeline:
             "decimal_info": decimal_info,
             "confidence": overall_conf,
             "status": status,
+            "reason": reason,
             "per_digit_confidence": per_digit_conf,
             "is_mid_roll": is_mid_roll,
-            "detector_confidence": round(det_conf, 4),
+            "diagnostics": slot_diagnostics,
+            "slot_diagnostics": slot_diagnostics,
+            "detector_confidence": float(round(det_conf, 4)),
             "dial_variant": layout_info["variant"],
             "window_crop": window_crop,
             "oriented_window": oriented_window,
@@ -213,17 +230,22 @@ class DialReadingPipeline:
             "slot_ranges": slot_ranges,
             "digit_vertical_positions": digit_positions,
             "detected_overlay": overlay,
-            "detection_box": top_det.get("pixel_bbox")
+            "detection_box": top_det.get("pixel_bbox"),
+            "red_drum_crop": proc.get("red_drum_crop"),
+            "red_drum_range": proc.get("red_drum_range"),
+            "tick_crop": proc.get("tick_crop"),
+            "tick_range": proc.get("tick_range"),
+            "vernier_margin_px": proc.get("vernier_margin_px", 0)
         }
 
 
 def main():
-    parser = argparse.ArgumentParser(description="End-to-End Dial Reading CLI with ANN Classifier")
+    parser = argparse.ArgumentParser(description="End-to-End Dial Reading CLI with Classical CV Recognizer")
     parser.add_argument("--image", type=str, required=True, help="Path to dial image (.jpg, .png, etc.)")
     parser.add_argument("--detector_weights", type=str, default=None)
     parser.add_argument("--classifier_weights", type=str, default="models/best_digit_ann.pt")
     parser.add_argument("--config", type=str, default="configs/digit_ann.yaml")
-    parser.add_argument("--min_conf", type=float, default=0.65, help="Minimum per-digit confidence")
+    parser.add_argument("--min_conf", type=float, default=0.35, help="Minimum per-digit confidence")
     parser.add_argument("--orientation", type=int, default=None, help="Manual rotation angle (0/90/180/270)")
     parser.add_argument("--device", type=str, default="cpu")
 

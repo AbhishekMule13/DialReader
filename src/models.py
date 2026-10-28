@@ -18,6 +18,9 @@ import torch.nn.functional as F
 from torchvision import transforms
 from PIL import Image
 
+# Classical Computer Vision Digit Recognizer
+from src.digits import PixelDigitRecognizer, DigitTemplateLibrary, DigitTemplate
+
 
 def get_activation(name: str) -> nn.Module:
     """
